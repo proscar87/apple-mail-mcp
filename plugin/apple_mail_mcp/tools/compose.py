@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Optional, List, Tuple
 
 from apple_mail_mcp.server import mcp, READ_ONLY
+from apple_mail_mcp.tools.raw_source import get_email_source
+from apple_mail_mcp.tools.reply_verification import verify_reply_body_outside_quote
 from apple_mail_mcp.core import (
     inject_preferences,
     escape_applescript,
@@ -619,6 +621,39 @@ def _validate_attachment_paths(attachments: str) -> Tuple[List[str], Optional[st
     return resolved_paths, None
 
 
+def _verify_saved_reply_body(
+    account: str, subject_keyword: str, reply_body: str
+) -> str:
+    """Read back a just-saved draft reply and verify the body landed above
+    Mail's quoted original, not inside it (#71).
+
+    Only called for `mode="draft"`: that is the one case where the message
+    is guaranteed to already be sitting in a mailbox (Drafts) by the time
+    the AppleScript that saved it has returned, so re-reading it via the
+    existing `get_email_source` tool is safe and synchronous. "send" moves
+    the message to Sent, and "open" leaves it unsaved in a compose window
+    with nothing in a mailbox yet to read back -- neither is covered here.
+
+    Reuses `get_email_source` rather than adding new AppleScript, so this
+    verification step carries no additional live-execution risk beyond a
+    tool this codebase already runs and tests.
+
+    Best-effort: `get_email_source`'s subject match is "first message whose
+    subject contains this substring", the same matching the rest of this
+    tool already relies on -- a second draft with a similar subject could
+    in principle be read back instead of the one just saved.
+    """
+    raw_source = get_email_source(
+        account=account, subject_keyword=subject_keyword, mailbox="Drafts"
+    )
+    if raw_source.startswith("Error"):
+        return f"Verification: could not re-read the saved draft ({raw_source})"
+
+    verified, detail = verify_reply_body_outside_quote(raw_source, reply_body)
+    status = "PASSED" if verified else "FAILED"
+    return f"Verification ({status}): {detail}"
+
+
 @mcp.tool()
 @inject_preferences
 def reply_to_email(
@@ -948,7 +983,17 @@ tell application "Mail"
         if result.returncode != 0:
             stderr = result.stderr.decode("utf-8", errors="replace").strip()
             return f"Error in reply: {stderr}"
-        return result.stdout.decode("utf-8", errors="replace").strip()
+        output_text = result.stdout.decode("utf-8", errors="replace").strip()
+        # Checking for the absence of "Error" is not enough: "No email found
+        # matching: <keyword>" is also a failure to reach a saved draft, and
+        # does not start with "Error" either. `success_text` is the one
+        # positive signal this function's own AppleScript emits only on the
+        # branch that actually saved something.
+        if effective_mode == "draft" and success_text in output_text:
+            output_text += "\n" + _verify_saved_reply_body(
+                account, subject_keyword, reply_body
+            )
+        return output_text
     except subprocess.TimeoutExpired:
         return "Error: Reply script timed out"
     finally:
