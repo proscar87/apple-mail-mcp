@@ -26,7 +26,7 @@ behaviour, which never checked in the first place.
 import html
 import re
 from email import message_from_string, policy
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 _CITE_BLOCKQUOTE_RE = re.compile(
     r'<blockquote[^>]*\btype\s*=\s*["\']cite["\'][^>]*>', re.IGNORECASE
@@ -87,6 +87,80 @@ def _normalize(text: str) -> str:
     without_tags = _TAG_RE.sub(" ", text)
     unescaped = html.unescape(without_tags)
     return " ".join(unescaped.split())
+
+
+def _extract_addresses(raw_source: str, header_name: str) -> List[str]:
+    """Return the addr-spec list for one address-type header (`to`, `cc`).
+
+    `Bcc` is deliberately not offered through this helper. Whether an
+    unsent Mail.app draft's own RFC 822 source retains a `Bcc` header at
+    all -- as opposed to only applying it at send time, the way SMTP
+    conventionally strips it from what's transmitted -- is not something
+    this repo can determine without a live Mail.app draft to inspect, and
+    guessing at it risks a check that always silently reports "not found"
+    and is mistaken for a working verification.
+    """
+    msg = message_from_string(raw_source, policy=policy.default)
+    header = msg[header_name]
+    if header is None:
+        return []
+    return [address.addr_spec for address in header.addresses]
+
+
+def verify_recipients(
+    raw_source: str,
+    *,
+    expected_cc: Optional[str] = None,
+    expected_from: Optional[str] = None,
+) -> Tuple[bool, str]:
+    """Verify the saved draft's actual To/Cc/From against what was intended.
+
+    `reply_to_email`'s own AppleScript reports "To: " followed by the
+    *original message's sender* -- correct for a plain reply, but
+    misleading whenever Mail's own reply-to-all/CC/sender-override
+    behaviour means the actually-saved recipients differ from that (#70).
+    This reads the real, saved values instead of restating an assumption.
+
+    Args:
+        raw_source: RFC 822 source of the saved draft.
+        expected_cc: The `cc` argument `reply_to_email` was called with, if
+            any -- comma-separated addresses. Checked as a subset: every
+            requested address must appear in the saved `Cc` header. Extra
+            addresses Mail itself adds (e.g. via reply-to-all) are not
+            treated as a mismatch, since those were never the caller's to
+            specify in the first place.
+        expected_from: The `from_address` `reply_to_email` was called with,
+            if any. Checked for an exact match against the saved `From`.
+
+    Returns:
+        `(verified, detail)`. `detail` lists the actual saved To/Cc/From
+        and names anything requested that didn't make it into the saved
+        draft.
+    """
+    actual_to = _extract_addresses(raw_source, "to")
+    actual_cc = _extract_addresses(raw_source, "cc")
+    actual_from = _extract_addresses(raw_source, "from")
+
+    problems: List[str] = []
+
+    if expected_cc:
+        requested = [addr.strip() for addr in expected_cc.split(",") if addr.strip()]
+        missing = [addr for addr in requested if addr not in actual_cc]
+        if missing:
+            problems.append(
+                f"requested CC {missing} not found in saved Cc: {actual_cc}"
+            )
+
+    if expected_from:
+        if expected_from not in actual_from:
+            problems.append(
+                f"requested From {expected_from!r} not found in saved From: {actual_from}"
+            )
+
+    summary = f"To={actual_to} Cc={actual_cc} From={actual_from}"
+    if problems:
+        return False, f"{summary} -- " + "; ".join(problems)
+    return True, summary
 
 
 def verify_reply_body_outside_quote(

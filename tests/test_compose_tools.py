@@ -920,7 +920,9 @@ class ReplyDraftVerificationTests(unittest.TestCase):
     landed outside Mail's quoted original, rather than reporting success
     from the AppleScript's text presence alone."""
 
-    def _run_reply(self, get_email_source_return, **overrides):
+    def _run_reply(
+        self, get_email_source_return, run_applescript_return="", **overrides
+    ):
         kwargs = dict(
             account="Work",
             subject_keyword="test",
@@ -935,7 +937,10 @@ class ReplyDraftVerificationTests(unittest.TestCase):
                     stdout=b"Reply saved as draft!"
                 ),
             ),
-            patch("apple_mail_mcp.tools.compose.run_applescript"),
+            patch(
+                "apple_mail_mcp.tools.compose.run_applescript",
+                return_value=run_applescript_return,
+            ),
             patch(
                 "apple_mail_mcp.tools.compose.get_email_source",
                 return_value=get_email_source_return,
@@ -969,6 +974,69 @@ class ReplyDraftVerificationTests(unittest.TestCase):
         result, _ = self._run_reply("Error: account not found: Work")
 
         self.assertIn("could not re-read the saved draft", result)
+
+    def test_no_cc_or_from_address_skips_recipients_check(self):
+        """Plain reply with no cc/from_address override: nothing to verify
+        beyond the body, so no 'Recipients' line should appear (#70)."""
+        result, _ = self._run_reply(
+            "Content-Type: text/plain\r\n\r\n"
+            "Yes, 3pm works.\r\n\r\n> On Jan 1, sender wrote:\r\n> hi\r\n"
+        )
+
+        self.assertNotIn("Recipients", result)
+
+    def test_requested_cc_actually_saved_reports_passed(self):
+        """#70: verify the CC the caller asked for actually landed in the
+        saved draft, instead of trusting the request was honored."""
+        result, _ = self._run_reply(
+            "To: alice@example.com\r\nCc: carol@example.com\r\n"
+            "Content-Type: text/plain\r\n\r\n"
+            "Yes, 3pm works.\r\n\r\n> On Jan 1, sender wrote:\r\n> hi\r\n",
+            cc="carol@example.com",
+        )
+
+        self.assertIn("Recipients (PASSED)", result)
+
+    def test_requested_cc_missing_from_saved_draft_reports_failed(self):
+        """The exact #70 scenario: a requested CC that Mail silently
+        dropped (e.g. bad address) must be caught, not glossed over."""
+        result, _ = self._run_reply(
+            "To: alice@example.com\r\n"
+            "Content-Type: text/plain\r\n\r\n"
+            "Yes, 3pm works.\r\n\r\n> On Jan 1, sender wrote:\r\n> hi\r\n",
+            cc="carol@example.com",
+        )
+
+        self.assertIn("Recipients (FAILED)", result)
+        self.assertIn("carol@example.com", result)
+
+    def test_from_address_override_verified_against_saved_draft(self):
+        """A `from_address` override that Mail actually honored should
+        verify as PASSED against the saved draft's real From: header."""
+        result, _ = self._run_reply(
+            "From: alice@example.com\r\nTo: bob@example.com\r\n"
+            "Content-Type: text/plain\r\n\r\n"
+            "Yes, 3pm works.\r\n\r\n> On Jan 1, sender wrote:\r\n> hi\r\n",
+            run_applescript_return="alice@example.com",
+            from_address="alice@example.com",
+        )
+
+        self.assertIn("Recipients (PASSED)", result)
+
+    def test_from_address_override_not_applied_reports_failed(self):
+        """If Mail did not actually stamp the requested From: address into
+        the saved draft, that must surface as a failure, not a silent
+        assumption that the override took effect."""
+        result, _ = self._run_reply(
+            "From: work-default@example.com\r\nTo: bob@example.com\r\n"
+            "Content-Type: text/plain\r\n\r\n"
+            "Yes, 3pm works.\r\n\r\n> On Jan 1, sender wrote:\r\n> hi\r\n",
+            run_applescript_return="alice@example.com",
+            from_address="alice@example.com",
+        )
+
+        self.assertIn("Recipients (FAILED)", result)
+        self.assertIn("not found in saved From", result)
 
     def test_send_mode_does_not_attempt_verification(self):
         """Verification only runs for mode='draft' (see docstring on

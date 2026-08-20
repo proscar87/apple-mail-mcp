@@ -174,3 +174,107 @@ class VerifyReplyBodyOutsideQuoteTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class VerifyRecipientsTests(unittest.TestCase):
+    """Tests for verify_recipients (#70)."""
+
+    HEADERS = (
+        "From: sender@example.com\r\n"
+        "To: alice@example.com\r\n"
+        "Cc: bob@example.com, carol@example.com\r\n"
+        "Subject: Re: sync\r\n\r\n"
+        "body\r\n"
+    )
+
+    def test_no_expectations_always_verifies(self):
+        from apple_mail_mcp.tools.reply_verification import verify_recipients
+
+        verified, detail = verify_recipients(self.HEADERS)
+
+        self.assertTrue(verified)
+        self.assertIn("alice@example.com", detail)
+        self.assertIn("bob@example.com", detail)
+        self.assertIn("sender@example.com", detail)
+
+    def test_requested_cc_present_verifies(self):
+        from apple_mail_mcp.tools.reply_verification import verify_recipients
+
+        verified, _ = verify_recipients(self.HEADERS, expected_cc="bob@example.com")
+
+        self.assertTrue(verified)
+
+    def test_requested_cc_missing_from_saved_draft_is_caught(self):
+        """The exact scenario #70 flags: a CC the caller asked for that
+        didn't actually make it into the saved draft."""
+        from apple_mail_mcp.tools.reply_verification import verify_recipients
+
+        verified, detail = verify_recipients(
+            self.HEADERS, expected_cc="dave@example.com"
+        )
+
+        self.assertFalse(verified)
+        self.assertIn("dave@example.com", detail)
+        self.assertIn("not found in saved Cc", detail)
+
+    def test_extra_cc_mail_added_itself_is_not_a_mismatch(self):
+        """Reply-to-all can add CC recipients the caller never requested.
+        Those are not a verification failure -- only a *missing* requested
+        address is."""
+        from apple_mail_mcp.tools.reply_verification import verify_recipients
+
+        verified, _ = verify_recipients(self.HEADERS, expected_cc="bob@example.com")
+
+        self.assertTrue(verified)  # carol@example.com is present but unrequested
+
+    def test_multiple_requested_cc_addresses_all_checked(self):
+        from apple_mail_mcp.tools.reply_verification import verify_recipients
+
+        verified, detail = verify_recipients(
+            self.HEADERS, expected_cc="bob@example.com, dave@example.com"
+        )
+
+        self.assertFalse(verified)
+        # Only dave -- the one actually missing -- should be listed as the
+        # *requested-but-missing* CC; bob was requested and present, so he
+        # must not appear in that specific list (he legitimately still
+        # shows up in the "saved Cc" echo of the full actual Cc header).
+        missing_list = detail.split("requested CC ", 1)[1].split(" not found", 1)[0]
+        self.assertIn("dave@example.com", missing_list)
+        self.assertNotIn("bob@example.com", missing_list)
+
+    def test_requested_from_matching_actual_verifies(self):
+        from apple_mail_mcp.tools.reply_verification import verify_recipients
+
+        verified, _ = verify_recipients(
+            self.HEADERS, expected_from="sender@example.com"
+        )
+
+        self.assertTrue(verified)
+
+    def test_requested_from_not_matching_actual_is_caught(self):
+        """A sender override (`from_address`) that Mail silently ignored --
+        e.g. because it wasn't a configured alias for the account -- must
+        be reported, not assumed to have taken effect."""
+        from apple_mail_mcp.tools.reply_verification import verify_recipients
+
+        verified, detail = verify_recipients(
+            self.HEADERS, expected_from="other@example.com"
+        )
+
+        self.assertFalse(verified)
+        self.assertIn("other@example.com", detail)
+        self.assertIn("not found in saved From", detail)
+
+    def test_no_cc_header_at_all_with_no_expectation_verifies(self):
+        from apple_mail_mcp.tools.reply_verification import verify_recipients
+
+        source = (
+            "From: sender@example.com\r\nTo: alice@example.com\r\n"
+            "Subject: Re: sync\r\n\r\nbody\r\n"
+        )
+
+        verified, detail = verify_recipients(source)
+
+        self.assertTrue(verified)
+        self.assertIn("Cc=[]", detail)

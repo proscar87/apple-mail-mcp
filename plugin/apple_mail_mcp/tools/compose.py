@@ -11,7 +11,10 @@ from typing import Optional, List, Tuple
 
 from apple_mail_mcp.server import mcp, READ_ONLY
 from apple_mail_mcp.tools.raw_source import get_email_source
-from apple_mail_mcp.tools.reply_verification import verify_reply_body_outside_quote
+from apple_mail_mcp.tools.reply_verification import (
+    verify_reply_body_outside_quote,
+    verify_recipients,
+)
 from apple_mail_mcp.core import (
     inject_preferences,
     escape_applescript,
@@ -622,10 +625,19 @@ def _validate_attachment_paths(attachments: str) -> Tuple[List[str], Optional[st
 
 
 def _verify_saved_reply_body(
-    account: str, subject_keyword: str, reply_body: str
+    account: str,
+    subject_keyword: str,
+    reply_body: str,
+    expected_cc: Optional[str] = None,
+    expected_from: Optional[str] = None,
 ) -> str:
-    """Read back a just-saved draft reply and verify the body landed above
-    Mail's quoted original, not inside it (#71).
+    """Read back a just-saved draft reply and verify (a) the body landed
+    above Mail's quoted original, not inside it (#71), and (b) the actual
+    saved To/Cc/From headers, rather than trusting the AppleScript's own
+    account of what it did (#70) -- the AppleScript's "To: " line above is
+    only the sender of the message being replied to, echoed unconditionally;
+    it does not reflect what `reply to all` or a rejected `from_address`
+    override actually produced in the saved draft.
 
     Only called for `mode="draft"`: that is the one case where the message
     is guaranteed to already be sitting in a mailbox (Drafts) by the time
@@ -636,7 +648,8 @@ def _verify_saved_reply_body(
 
     Reuses `get_email_source` rather than adding new AppleScript, so this
     verification step carries no additional live-execution risk beyond a
-    tool this codebase already runs and tests.
+    tool this codebase already runs and tests. Both checks share the single
+    `get_email_source` round-trip.
 
     Best-effort: `get_email_source`'s subject match is "first message whose
     subject contains this substring", the same matching the rest of this
@@ -649,9 +662,18 @@ def _verify_saved_reply_body(
     if raw_source.startswith("Error"):
         return f"Verification: could not re-read the saved draft ({raw_source})"
 
-    verified, detail = verify_reply_body_outside_quote(raw_source, reply_body)
-    status = "PASSED" if verified else "FAILED"
-    return f"Verification ({status}): {detail}"
+    body_verified, body_detail = verify_reply_body_outside_quote(raw_source, reply_body)
+    body_status = "PASSED" if body_verified else "FAILED"
+    lines = [f"Verification ({body_status}): {body_detail}"]
+
+    if expected_cc or expected_from:
+        recipients_verified, recipients_detail = verify_recipients(
+            raw_source, expected_cc=expected_cc, expected_from=expected_from
+        )
+        recipients_status = "PASSED" if recipients_verified else "FAILED"
+        lines.append(f"Recipients ({recipients_status}): {recipients_detail}")
+
+    return "\n".join(lines)
 
 
 @mcp.tool()
@@ -991,7 +1013,11 @@ tell application "Mail"
         # branch that actually saved something.
         if effective_mode == "draft" and success_text in output_text:
             output_text += "\n" + _verify_saved_reply_body(
-                account, subject_keyword, reply_body
+                account,
+                subject_keyword,
+                reply_body,
+                expected_cc=cc,
+                expected_from=sender_override,
             )
         return output_text
     except subprocess.TimeoutExpired:
